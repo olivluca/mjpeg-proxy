@@ -5,7 +5,8 @@ import socket
 import socketserver
 import threading
 from urllib.parse import urlparse
-from queue import Queue
+import queue
+from time import sleep
 
 FORMAT_CONS = '%(asctime)s %(name)-26s %(levelname)8s\t%(message)s'
 logging.basicConfig(level=logging.INFO, format=FORMAT_CONS)
@@ -16,53 +17,88 @@ class MJEPGClient(threading.Thread):
         self.url_components = urlparse(mjpegurl)
         self.ready = []
         self.receivers = 0
+        self.connected = False
+        self.boundary = None
         self.log = logging.getLogger('MJEPGClient')
 
-
-    def run(self):
-        client_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
+    def connect(self):
+        self.log.info('connecting to server')
+        self.connected = False
+        self.client_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
         remote_host = self.url_components.netloc.split(':')[0]
         remote_port = int(self.url_components.port) if self.url_components.port is not None else 80
         self.log.info('Connecting to {}:{}'.format(remote_host, remote_port))
-        client_socket.connect((remote_host, remote_port))
-        get_request = "GET {}?{} HTTP/1.1\r\n\r\n".format(
-            self.url_components.path,
-            self.url_components.query
-        ).encode('utf-8')
-        self.log.debug("Request: {}".format(get_request))
-        client_socket.send(get_request)
-        boundary = None
-        while not boundary:
-            data = client_socket.recv(1024)
-            if not data:
-                break
-            if b'boundary=' in data:
-                for item in data.decode('utf-8').split():
-                    if 'boundary=' in item:
-                        boundary = b'\r\n\r\n%s\r\n' % item.split('=')[1].encode('utf-8')
-                        self.log.debug('Multipart boundary: {}'.format(boundary))
-                        break
-        buffer = bytes()
-        current_offset = 0
-        test_counter = 0
+        try:
+            self.client_socket.connect((remote_host, remote_port))
+            get_request = "GET {}{} HTTP/1.1\r\n\r\n".format(
+                self.url_components.path,
+                self.url_components.query
+            ).encode('utf-8')
+            self.log.info("Request: {}".format(get_request))
+            self.client_socket.send(get_request)
+            self.boundary = None
+            data = bytes()
+            while not self.boundary:
+                r = self.client_socket.recv(1024)
+                if not r:
+                    break
+                data += r
+                while data and not self.boundary:
+                    p=data.find(b'\r\n')
+                    if p>=0:
+                       line=data[:p]
+                       self.log.info('Header line {}'.format(line))
+                       data=data[p+2:]
+                       p=line.find(b'boundary=')
+                       if p>=0:
+                          self.boundary=b'--'+line[p+len(b'boundary='):]+b'\r\n'
+                          self.log.info('Multipart boundary: {}'.format(self.boundary))
+                          break
+            if not self.boundary:
+              self.log.error('No boundary found')
+              return
+            self.connected = True
+            self.log.info('connected')
+        except Exception as e:
+            self.connected = False
+            self.log.error(str(e))
+            return
+
+    def run(self):
         while self.receivers > 0:
-            buffer += client_socket.recv(1024)
-            offset = buffer.find(boundary, current_offset)
+            if not self.connected:
+                buffer = bytes()
+                current_offset = 0
+                self.connect()
+                if not self.connected:
+                    sleep(1)
+                    continue
+
+            r = self.client_socket.recv(1024)
+            if not r:
+                self.log.error('server disconnected')
+                self.connected=False
+                continue
+            buffer += r
+            offset = buffer.find(self.boundary, current_offset)
             if offset == -1:
-                current_offset = len(buffer) - len(boundary)
+                current_offset = len(buffer) - len(self.boundary)
             else:
                 for r in self.ready:
-                    r.out_queue.put(buffer[:offset])
-                    self.ready.remove(r)
-                test_counter = test_counter + 1
+                    try:
+                        r.out_queue.put_nowait(buffer[:offset])
+                    except queue.Full:
+                        self.log.error('queue full, kicking out client')
+                        r.queuefull=True
                 current_offset = 0
-                buffer = buffer[offset+len(boundary):]
+                buffer = buffer[offset+len(self.boundary):]
         self.log.info('Closing down.')
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
         self.log = logging.getLogger('ThreadedTCPRequestHandler')
         self.log.info('New connection from: {}'.format(self.client_address[0]))
+        self.queuefull=False
         if self.server.mjpegclient is None or not self.server.mjpegclient.is_alive():
             self.log.info("No MJPEGClient. Starting new one.")
             self.server.mjpegclient = MJEPGClient(self.server.mjpegurl)
@@ -71,39 +107,32 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
         else:
             # Need this else clause because we need to increment before starting above
             self.server.mjpegclient.receivers += 1
-        self.out_queue = Queue()
+        self.log.info('Receivers {}'.format(self.server.mjpegclient.receivers))
+        # I don't care about the headers so I just skip reading them
+        self.out_queue = queue.Queue(maxsize=1)
         request_buffer = bytes()
-        header_counter = 0
-        while True:
-            if header_counter == 10:
-                self.request.send("Asshole.\r\n")
-                return
-            request_buffer += self.request.recv(1024)
-            header_counter += 1
-            if b'\r\n\r\n' in request_buffer:
-                # We have one purpose only.
-                # We don't care what the client has to say.
-                # ...but let's log it anyway.
-                self.log.debug(request_buffer)
-                break
-
         self.request.send(b'HTTP/1.0 200 OK\r\n')
         self.request.send(b'Connection: Close\r\n')
         self.request.send(b'Server: mjpeg-proxy\r\n')
-        self.request.send(b'Content-Type: multipart/x-mixed-replace; boundary=--myboundary\r\n\r\n')
-        while True:
+        self.request.send(b'Content-Type: multipart/x-mixed-replace; boundary=--myboundary\r\n')
+        self.request.send(b'Cache-Control: no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0\r\n')
+        self.request.send(b'Pragma: no-cache\r\n')
+        self.request.send(b'Expires: Mon, 1 Jan 2000 00:00:00 GMT\r\n');
+        self.request.send(b'\r\n')
+        self.server.mjpegclient.ready.append(self)
+        while not self.queuefull:
             try:
-                self.server.mjpegclient.ready.append(self)
                 frame = self.out_queue.get()
                 self.request.send(b'--myboundary\r\n')
                 self.request.send(frame)
             except BrokenPipeError:
-                self.log.debug('Connection closed from {}: Broken pipe.'.format(self.client_address[0]))
+                self.log.info('Connection closed from {}: Broken pipe.'.format(self.client_address[0]))
                 break
             except ConnectionResetError:
-                self.log.debug('Connection closed from {}: Connection reset by peer.'.format(self.client_address[0]))
+                self.log.info('Connection closed from {}: Connection reset by peer.'.format(self.client_address[0]))
                 break
         self.server.mjpegclient.receivers -= 1
+        self.log.info('Remaining receivers {}'.format(self.server.mjpegclient.receivers))
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def __init__(self, bindhost, handler, mjpegurl):
