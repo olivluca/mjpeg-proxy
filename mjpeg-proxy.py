@@ -109,7 +109,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             self.server.mjpegclient.receivers += 1
         self.log.info('Receivers {}'.format(self.server.mjpegclient.receivers))
         # I don't care about the headers so I just skip reading them
-        self.out_queue = queue.Queue(maxsize=1)
+        self.out_queue = queue.Queue(maxsize=50)
         request_buffer = bytes()
         self.request.send(b'HTTP/1.0 200 OK\r\n')
         self.request.send(b'Connection: Close\r\n')
